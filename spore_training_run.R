@@ -12,7 +12,6 @@ model <- create_model_lstm_cnn(
   layer_dense = c(128, 1),
   kernel_size = kernel_size,
   filters = filters,
-  strides = NULL,
   pool_size = pool_size,
   learning_rate = 0.000025,
   last_layer_activation = "sigmoid",
@@ -61,3 +60,4 @@ train_model(
   max_samples = 4,
   concat_seq = concat_seq,
   target_from_csv = target_from_csv)
+
