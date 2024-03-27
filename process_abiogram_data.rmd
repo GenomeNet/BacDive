@@ -1,0 +1,194 @@
+---
+title: "Process ABR Data for Deep Learning"
+output:
+  html_document:
+    df_print: paged
+---
+
+This notebook outlines the process for preparing antibiogram data for deep learning analysis. It includes steps for data cleaning, feature extraction, and preparation of training, validation, and test datasets based on taxonomic annotation.
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(data.table)
+library(caret)
+source("utils.r")
+```
+## Importing Data
+
+Read in the antibiogram data from an RDS file. This dataset contains measurements from antibiogram tests. We filter for manually annotated entries to ensure data quality.
+
+```{r}
+annot <- readRDS("bacdvie_live_20230830.rds")
+abr_data <- as.data.frame(annot$met_antibiogram) %>%
+  filter(manual_annotation == 1)
+```
+
+
+
+## Preparing Target Data for Deep Learning
+
+Generate a CSV file containing target values for deep learning models. This involves calculating the mean diameters for each antibiotic based on their start and end range values.
+
+
+```{r}
+# Generate target table with mean diameter values for antibiotics
+antibiotic_columns <- grep("_rgStart|_rgEnd", names(abr_data), value = TRUE)
+antibiotics <- unique(sub("_[^_]+$", "", antibiotic_columns))
+target_data <- abr_data %>% select(ID_strains, all_of(antibiotic_columns))
+
+for (antibiotic in antibiotics) {
+  start_col <- paste0(antibiotic, "_rgStart")
+  end_col <- paste0(antibiotic, "_rgEnd")
+  target_data <- target_data %>%
+    mutate(!!antibiotic := rowMeans(select(., starts_with(antibiotic)), na.rm = TRUE))
+}
+
+# Drop start and end columns, retaining mean values
+target_data <- target_data %>% select(ID_strains, all_of(antibiotics))
+dim(target_data)
+write.csv(target_data, "target_table.csv", row.names = FALSE)
+```
+
+## Preparing Input Data
+
+Create a CSV file for the input features. This includes environmental conditions under which each antibiogram test was conducted. Missing values are replaced with default values.
+
+
+```{r}
+# Select environmental conditions and replace NA values with defaults
+input_table <- abr_data %>%
+  select(ID_strains, Medium_antibiogram, Inc_temp_antibiogram, Inc_time_antibiogram, Inc_ox_antibiogram) %>%
+  mutate(Inc_ox_antibiogram = ifelse(is.na(Inc_ox_antibiogram), 'aerob', Inc_ox_antibiogram),
+         Inc_temp_antibiogram = ifelse(is.na(Inc_temp_antibiogram), 37, Inc_temp_antibiogram),
+         Inc_time_antibiogram = ifelse(is.na(Inc_time_antibiogram), 1, Inc_time_antibiogram))
+
+# Check for and warn about remaining NA values
+remaining_na <- sum(is.na(input_table))
+if (remaining_na > 0) {
+  warning("There are still NA values remaining in the input_table.")
+}
+
+# Export input data to CSV
+write.csv(input_table, "input_table.csv", row.names = FALSE)
+dim(input_table) # 596   5
+
+
+# Get the indices of duplicate rows in train_val_data_input
+rows_to_exclude <- which(duplicated(input_table))
+target_data_filtered <- target_data[-rows_to_exclude, ]
+dim(target_data_filtered)
+input_table_filtered <- input_table[-rows_to_exclude, ]
+dim(input_table_filtered)
+target_data_filtered$ID_strains <- NULL
+merged <- as.data.frame(cbind(input_table_filtered, target_data_filtered))
+```
+
+## Merging Additional Metadata
+
+Incorporate taxonomic and filename information for a comprehensive dataset. This aids in stratifying the data by taxonomic classification.
+
+```{r}
+# Read taxonomic and filename data
+taxa <- readRDS("strainsData.rds")
+taxa <- data.frame(ID_strains = taxa$ID_strains, genus = taxa$genus)
+filenames <- readRDS("filenameData.rds")
+
+# adding file names
+full_w_filenames <- merge(merged, filenames, by = "ID_strains", all.x = T)
+full_w_filenames_taxon <- merge(full_w_filenames, taxa, by = "ID_strains", all.x = T)
+
+full_w_filenames_taxon_filtered <- full_w_filenames_taxon[which(!is.na(full_w_filenames_taxon$filename)),]
+
+full_w_filenames_taxon_filtered$ID_strains <- NULL
+full_w_filenames_taxon_filtered$Medium_antibiogram <- NULL
+full_w_filenames_taxon_filtered$Inc_temp_antibiogram <- NULL
+full_w_filenames_taxon_filtered$Inc_time_antibiogram <- NULL
+full_w_filenames_taxon_filtered$Inc_ox_antibiogram <- NULL
+full_w_filenames_taxon_filtered$assembly_lvl <- NULL
+full_w_filenames_taxon_filtered$size <- NULL
+
+
+merged_data <- full_w_filenames_taxon_filtered %>%
+  group_by(filename, genus) %>%
+  summarise(across(all_of(antibiotics), ~ if (all(is.na(.x))) NA else sample(na.omit(.x), 1))) %>%
+  ungroup()
+
+nrow(merged_data)
+```
+
+
+## Dataset Partitioning
+
+Partition the data into training, validation, and test sets based on taxonomic classification, ensuring that each set includes a diverse representation of genera.
+
+```{r}
+# Analyze genus distribution
+genus_distribution <- table(merged_data$genus)
+genus_frequency <- as.data.frame(table(merged_data$genus))
+
+# Partitioning logic
+test_percentage <- 0.20
+num_test_entries <- ceiling(nrow(merged_data) * test_percentage)
+set.seed(123) # Ensure reproducibility
+
+shuffled_genus_frequency <- genus_frequency[sample(nrow(genus_frequency)), ]
+shuffled_genus_frequency$Var1 <- as.character(shuffled_genus_frequency$Var1)
+
+cumulative_frequency <- 0
+selected_genera <- character(0)
+
+for (i in 1:nrow(shuffled_genus_frequency)) {
+  if (cumulative_frequency < num_test_entries) {
+    selected_genera <- c(selected_genera, shuffled_genus_frequency$Var1[i])
+    cumulative_frequency <- cumulative_frequency + shuffled_genus_frequency$Freq[i]
+  } else {
+    break
+  }
+}
+
+# Split data into test, training, and validation sets
+test_data <- merged_data %>% filter(genus %in% selected_genera)
+train_val_data <- merged_data %>% filter(!(genus %in% selected_genera))
+
+
+trainIndex <- createDataPartition(train_val_data$genus, p = 0.7, list = FALSE, times = 1)
+train_data <- train_val_data[trainIndex, ]
+validation_data <- train_val_data[-trainIndex, ]
+
+# Label dataset type
+train_data$dataset_type <- 'train'
+validation_data$dataset_type <- 'validation'
+test_data$dataset_type <- 'test'
+
+# Combine and clean final dataset
+final_data <- rbind(train_data, validation_data, test_data)
+final_data$assembly_lvl <- NULL
+final_data$size <- NULL
+final_data$genus <- NULL
+```
+
+
+Output
+
+```{r}
+
+
+dim(final_data)
+
+str(final_data)
+
+labels <- data.frame(filename = final_data$filename,
+                     type = final_data$dataset_type)
+
+final_data$dataset_type <- NULL
+
+final_data <- final_data %>%
+  mutate(across(where(is.numeric), round))
+
+write.csv(final_data, file="training_abiogram_2024-03-27.csv", quote=FALSE, row.names=FALSE, col.names=TRUE)
+write.csv(labels, file="training_abiogram_labels_2024-03-27.csv", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
